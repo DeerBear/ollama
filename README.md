@@ -7,6 +7,7 @@
 # Ollama
 
 Get up and running with large language models.
+What this fork does: this fork aims at integrating a new way to reorganise weights at runtime, with the goal of making less-powered models more capable when run.
 
 ### macOS
 
