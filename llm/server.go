@@ -301,11 +301,16 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 		err := s.cmd.Wait()
 		// Favor a more detailed message over the process exit status
 		if err != nil && s.status != nil && s.status.LastErrMsg != "" {
-			slog.Error("llama runner terminated", "error", err)
+			slog.Error("llama runner terminated", "error", err, "detail", s.status.LastErrMsg)
 			if strings.Contains(s.status.LastErrMsg, "unknown model") {
 				s.status.LastErrMsg = "this model is not supported by your version of Ollama. You may need to upgrade"
 			}
 			s.doneErr = errors.New(s.status.LastErrMsg)
+		} else if err != nil {
+			// Process exited with an error but no recognized error message was captured.
+			// Include the exit status for debugging (e.g. signal: segmentation fault).
+			slog.Error("llama runner terminated unexpectedly", "error", err)
+			s.doneErr = fmt.Errorf("llama runner crashed: %w", err)
 		} else {
 			s.doneErr = err
 		}
@@ -1205,6 +1210,9 @@ func (s *llmServer) initModel(ctx context.Context, req LoadRequest, operation Lo
 	resp, err := http.DefaultClient.Do(r)
 	if err != nil {
 		slog.Error("do load request", "error", err)
+		if s.status != nil && s.status.LastErrMsg != "" {
+			return nil, fmt.Errorf("model failed to load: %s", s.status.LastErrMsg)
+		}
 		return nil, errors.New("model failed to load, this may be due to resource limitations or an internal error, check ollama server logs for details")
 	}
 	defer resp.Body.Close()
@@ -1610,6 +1618,9 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 		return err
 	} else if err != nil {
 		slog.Error("post predict", "error", err)
+		if s.status != nil && s.status.LastErrMsg != "" {
+			return fmt.Errorf("model runner has unexpectedly stopped: %s", s.status.LastErrMsg)
+		}
 		return errors.New("model runner has unexpectedly stopped, this may be due to resource limitations or an internal error, check ollama server logs for details")
 	}
 	defer res.Body.Close()
