@@ -63,9 +63,9 @@ RUN microdnf install -y ca-certificates curl python3 procps-ng \
 COPY --from=ggml-build /build/dist/lib/ollama /usr/lib/ollama
 COPY --from=go-build /bin/ollama /usr/bin/ollama
 
-# KAN environment
-ENV OLLAMA_KAN_ATTENTION=1
-ENV OLLAMA_FLASH_ATTENTION=false
+# KAN environment — KAN is OFF by default so the baseline phase works.
+# The demo script explicitly enables KAN when needed.
+ENV OLLAMA_KAN_ATTENTION=0
 ENV OLLAMA_DEBUG=1
 ENV OLLAMA_HOST=0.0.0.0:11434
 

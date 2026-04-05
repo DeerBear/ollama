@@ -19,11 +19,23 @@ warn()   { echo -e "${YELLOW}[WAIT]${NC} $1"; }
 
 chat() {
     local prompt="$1"
-    curl -s "${BASE_URL}/api/chat" -d "{
+    local raw
+    raw=$(curl -s --max-time 120 "${BASE_URL}/api/chat" -d "{
         \"model\": \"${MODEL}\",
         \"messages\": [{\"role\": \"user\", \"content\": $(echo "$prompt" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')}],
         \"stream\": false
-    }" 2>/dev/null | python3 -c 'import json,sys; print(json.loads(sys.stdin.read()).get("message",{}).get("content","[no response]"))' 2>/dev/null
+    }" 2>&1)
+    if [ -z "$raw" ]; then
+        echo "[no response - empty reply from server]"
+        return
+    fi
+    local parsed
+    parsed=$(echo "$raw" | python3 -c 'import json,sys; data=json.loads(sys.stdin.read()); print(data.get("message",{}).get("content","[no response - no message in JSON]"))' 2>/dev/null)
+    if [ -z "$parsed" ]; then
+        echo "[no response - parse error: ${raw:0:200}]"
+        return
+    fi
+    echo "$parsed"
 }
 
 start_server() {
@@ -149,18 +161,18 @@ info "  2. Warm-up: Train the KAN with 5 prompts"
 info "  3. KAN: Same 8 tests with KAN attention (KAN ON)"
 echo ""
 
-# ─── Step 1: Use already-running server for baseline (KAN OFF by default) ───
+# ─── Step 1: Start a clean baseline server with KAN OFF ───
 header "Step 1: Baseline (Standard Softmax)"
 
-info "Using already-running server (KAN disabled by default)..."
-# Wait for the server that Docker CMD started
-for i in $(seq 1 30); do
-    if curl -s "${BASE_URL}/api/tags" > /dev/null 2>&1; then
-        info "Server ready!"
-        break
-    fi
-    sleep 1
-done
+# The Dockerfile may set OLLAMA_KAN_ATTENTION=1 globally, so we must
+# stop any running server and restart with KAN explicitly disabled.
+info "Stopping any running server to ensure clean baseline..."
+stop_server
+
+export OLLAMA_KAN_ATTENTION=0
+export OLLAMA_FLASH_ATTENTION=true
+info "Starting server with KAN DISABLED for baseline..."
+start_server
 
 info "Pulling ${MODEL}..."
 ollama pull "${MODEL}"
