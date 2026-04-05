@@ -10,9 +10,10 @@ import (
 	"github.com/ollama/ollama/ml/nn/kan"
 )
 
-// kanTrainer is the global KAN shadow trainer, set via SetKANTrainer.
+// kanTrainer is the KAN shadow trainer for attention operations.
 // When non-nil, attention operations will shadow-train KAN layers
 // alongside softmax and optionally hot-swap converged layers.
+// Also registered as a KAN module for centralized flush/reset.
 var (
 	kanTrainer *kan.ShadowTrainer
 	kanMu      sync.RWMutex
@@ -42,14 +43,20 @@ var (
 	kanPending   []kanPendingItem
 )
 
-// SetKANTrainer installs a KAN shadow trainer for all attention operations.
+// SetKANTrainer installs a KAN shadow trainer for attention operations
+// and registers it as a KAN module for centralized flush/reset.
 // Pass nil to disable KAN attention.
 func SetKANTrainer(trainer *kan.ShadowTrainer) {
 	kanMu.Lock()
 	defer kanMu.Unlock()
 	kanTrainer = trainer
 	if trainer != nil {
-		slog.Info("KAN attention shadow training enabled")
+		RegisterKANModule(KANModule{
+			Name:    "attention",
+			Trainer: trainer,
+			Flush:   func(_ *kan.ShadowTrainer) { FlushKANTraining() },
+			Reset:   func() { ResetKANLayerCounter() },
+		})
 	}
 }
 

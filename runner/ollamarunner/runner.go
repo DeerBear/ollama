@@ -725,11 +725,10 @@ func (s *Server) computeBatch(activeBatch batchState) {
 
 	outputs := activeBatch.modelOutput.Floats()
 
-	// Process deferred KAN training now that tensor data is materialized.
-	// Must be called AFTER modelOutput.Floats() which triggers scheduler
-	// synchronization. Training tensors use ReadFloats() which reads
-	// directly from computed graph memory without needing sync callbacks.
-	nn.FlushKANTraining()
+	// Process deferred KAN training for all registered modules now that
+	// tensor data is materialized. Must be called AFTER modelOutput.Floats()
+	// which triggers scheduler synchronization.
+	nn.FlushAllKANModules()
 	t := time.Now()
 
 	logutil.Trace("computeBatch: logits ready", "batchID", activeBatch.id)
@@ -1285,12 +1284,10 @@ func (s *Server) allocModel(
 		return err
 	}
 
-	// Reset KAN layer counter after graph reservation and discard pending
-	// training items. The reservation forward passes create pending items
-	// with tensors that were reserved but never computed — processing them
-	// via FlushKANTraining would train on uninitialized memory and corrupt
-	// Adam optimizer state.
-	nn.ResetKANLayerCounter()
+	// Reset all KAN modules after graph reservation. The reservation forward
+	// passes create pending items with tensors that were reserved but never
+	// computed — processing them would train on uninitialized memory.
+	nn.ResetAllKANModules()
 
 	return nil
 }

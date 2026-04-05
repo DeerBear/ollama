@@ -36,13 +36,21 @@ func (a *adamState) growTo(n int) {
 	a.v = newV
 }
 
-// ShadowTrainer manages online training of KAN layers to match softmax output.
-// It runs KAN forward passes in parallel with softmax and uses finite-difference
-// gradient estimation with Adam optimizer to update the KAN coefficients.
+// ShadowTrainer manages online training of KAN layers using a pluggable
+// Objective. It runs KAN forward passes, uses finite-difference gradient
+// estimation with Adam optimizer, and tracks convergence — all independent
+// of what the KAN is being trained to do.
+//
+// The Objective interface determines the loss function (Phase 1), the
+// self-evolution signal (Phase 2), and the drift safety metric. This
+// makes ShadowTrainer reusable for attention softmax, KV cache values,
+// key representations, positional scaling, MLP activations, or any other
+// scenario where a learnable scalar transform is useful.
 type ShadowTrainer struct {
-	cfg    Config
-	layers map[string]*layerState
-	mu     sync.RWMutex
+	cfg       Config
+	objective Objective
+	layers    map[string]*layerState
+	mu        sync.RWMutex
 }
 
 type layerState struct {
@@ -81,11 +89,17 @@ type layerState struct {
 	phase2DataCounter int
 }
 
-// NewShadowTrainer creates a new trainer with the given configuration.
-func NewShadowTrainer(cfg Config) *ShadowTrainer {
+// NewShadowTrainer creates a new trainer with the given configuration and objective.
+// If objective is nil, defaults to AttentionObjective (softmax replacement).
+func NewShadowTrainer(cfg Config, objective ...Objective) *ShadowTrainer {
+	var obj Objective = AttentionObjective{}
+	if len(objective) > 0 && objective[0] != nil {
+		obj = objective[0]
+	}
 	return &ShadowTrainer{
-		cfg:    cfg,
-		layers: make(map[string]*layerState),
+		cfg:       cfg,
+		objective: obj,
+		layers:    make(map[string]*layerState),
 	}
 }
 
@@ -203,7 +217,7 @@ func (s *ShadowTrainer) TrainStep(key string, logits, softmaxOut []float32, seqK
 	scratch := state.kan.Snapshot()
 	coeffs := scratch.GetCoefficients()
 	kanOut := scratch.Forward(logits, seqK, seqQ)
-	baseLoss := mse(softmaxOut, kanOut)
+	baseLoss := s.objective.Phase1Loss(softmaxOut, kanOut, seqK, seqQ)
 
 	// Finite-difference gradient estimation for each coefficient
 	grads := make([]float64, len(coeffs))
@@ -216,7 +230,7 @@ func (s *ShadowTrainer) TrainStep(key string, logits, softmaxOut []float32, seqK
 		perturbed[i] += eps
 		scratch.UpdateCoefficients(perturbed)
 		kanOutPlus := scratch.Forward(logits, seqK, seqQ)
-		lossPlus := mse(softmaxOut, kanOutPlus)
+		lossPlus := s.objective.Phase1Loss(softmaxOut, kanOutPlus, seqK, seqQ)
 
 		// Single-sided finite difference: grad = (loss+ - loss) / eps
 		g := (lossPlus - baseLoss) / float64(eps)
@@ -266,7 +280,7 @@ func (s *ShadowTrainer) TrainStep(key string, logits, softmaxOut []float32, seqK
 
 	// Compute loss after update
 	finalOut := state.kan.Forward(logits, seqK, seqQ)
-	finalLoss := mse(softmaxOut, finalOut)
+	finalLoss := s.objective.Phase1Loss(softmaxOut, finalOut, seqK, seqQ)
 
 	if math.IsNaN(finalLoss) || math.IsInf(finalLoss, 0) {
 		finalLoss = state.emaLoss // Skip this step if numerical issues
@@ -497,10 +511,10 @@ func (s *ShadowTrainer) Phase2Step(key string, logits []float32, seqK, seqQ int)
 	scratch := state.kan.Snapshot()
 	coeffs := scratch.GetCoefficients()
 	kanOut := scratch.Forward(logits, seqK, seqQ)
-	baseSharpness := sharpness(kanOut, seqK, seqQ)
+	baseObjective := s.objective.Phase2Objective(kanOut, seqK, seqQ)
 
-	// Finite-difference gradient estimation against sharpness
-	// Uses scratch layer to avoid mutating the live KAN during perturbation
+	// Finite-difference gradient estimation against the Phase 2 objective.
+	// Uses scratch layer to avoid mutating the live KAN during perturbation.
 	grads := make([]float64, len(coeffs))
 	eps := s.cfg.GradEpsilon
 
@@ -510,11 +524,11 @@ func (s *ShadowTrainer) Phase2Step(key string, logits []float32, seqK, seqQ int)
 		perturbed[i] += eps
 		scratch.UpdateCoefficients(perturbed)
 		kanOutPlus := scratch.Forward(logits, seqK, seqQ)
-		sharpPlus := sharpness(kanOutPlus, seqK, seqQ)
+		objPlus := s.objective.Phase2Objective(kanOutPlus, seqK, seqQ)
 
-		// We want to MAXIMIZE sharpness, so gradient ascent:
-		// grad = (sharp+ - sharp) / eps
-		g := (sharpPlus - baseSharpness) / float64(eps)
+		// Gradient ascent: maximize the objective
+		// grad = (obj+ - obj) / eps
+		g := (objPlus - baseObjective) / float64(eps)
 		if math.IsNaN(g) || math.IsInf(g, 0) {
 			g = 0
 		}
@@ -551,14 +565,14 @@ func (s *ShadowTrainer) Phase2Step(key string, logits []float32, seqK, seqQ int)
 	// Apply geometric mean normalization + redistribution
 	state.kan.UpdateCoefficients(newCoeffs)
 
-	// Check drift: compute KL divergence from graduation checkpoint
+	// Check drift from graduation checkpoint using the objective's metric
 	newOut := state.kan.Forward(logits, seqK, seqQ)
 
 	// Get graduation output for comparison
 	gradLayer := NewLayerFromWeights(s.cfg, state.graduationWeights)
 	gradOut := gradLayer.Forward(logits, seqK, seqQ)
 
-	drift := klDivergence(gradOut, newOut, seqK, seqQ)
+	drift := s.objective.DriftMetric(gradOut, newOut, seqK, seqQ)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -573,8 +587,8 @@ func (s *ShadowTrainer) Phase2Step(key string, logits []float32, seqK, seqQ int)
 		return state.emaSharpness, true
 	}
 
-	// Update sharpness tracking and effective scale
-	newSharpness := sharpness(newOut, seqK, seqQ)
+	// Update Phase 2 objective tracking and effective scale
+	newSharpness := s.objective.Phase2Objective(newOut, seqK, seqQ)
 	if state.emaSharpness == 0 {
 		state.emaSharpness = newSharpness
 	} else {
