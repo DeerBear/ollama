@@ -336,26 +336,31 @@ func TestShadowTrainerConvergesToSoftmax(t *testing.T) {
 	trainer := NewShadowTrainer(cfg)
 	key := LayerKey(0)
 
-	// Train for enough steps to see significant loss reduction
-	initialLoss := trainer.TrainStep(key, logitsF32, targetF32, 4, 1)
+	// With correct identity initialization, the KAN should already be
+	// very close to softmax from the start. Train a few steps to confirm
+	// it stays close and doesn't diverge.
 	var finalLoss float64
-	for i := 0; i < 500; i++ {
+	for i := 0; i < 100; i++ {
 		finalLoss = trainer.TrainStep(key, logitsF32, targetF32, 4, 1)
 	}
 
-	t.Logf("initial_loss=%f, final_loss=%f, reduction=%.1fx", initialLoss, finalLoss, initialLoss/finalLoss)
+	t.Logf("final_loss=%e", finalLoss)
 
-	// Loss must have decreased significantly
-	if finalLoss >= initialLoss {
-		t.Errorf("training did not reduce loss: initial=%f, final=%f", initialLoss, finalLoss)
-	}
-
-	// After training, KAN output should approximate softmax
+	// After training, KAN output should approximate softmax closely
 	kanLayer := trainer.GetOrCreateLayer(key)
 	kanOut := kanLayer.Forward(logitsF32, 4, 1)
 
 	t.Logf("target:  %v", targetF32)
 	t.Logf("kan_out: %v", kanOut)
+
+	// Each element should be close to softmax output
+	for i := range kanOut {
+		diff := math.Abs(float64(kanOut[i]) - float64(targetF32[i]))
+		if diff > 0.01 {
+			t.Errorf("kanOut[%d]=%f differs from target[%d]=%f by %f",
+				i, kanOut[i], i, targetF32[i], diff)
+		}
+	}
 
 	// Check that the KAN output has the correct relative ordering
 	for i := 0; i < len(kanOut)-1; i++ {
@@ -1197,21 +1202,24 @@ func TestMultiHeadGetSetCoefficients(t *testing.T) {
 
 func TestDynamicHeadSpawning(t *testing.T) {
 	cfg := DefaultConfig()
-	cfg.LearningRate = 0.001 // Slow enough to plateau
+	cfg.LearningRate = 0.0 // Zero learning rate — no improvement possible, guarantees plateau
 	cfg.MaxHeads = 3
-	cfg.PlateauWindow = 50
-	cfg.PlateauImprovement = 0.01 // 1% improvement threshold
-	cfg.ConvergenceThreshold = 1e-6 // Very tight — won't converge with 1 head
+	cfg.PlateauWindow = 20
+	cfg.PlateauImprovement = 0.05
+	cfg.ConvergenceThreshold = 1e-12 // Unreachable — won't converge
 
 	trainer := NewShadowTrainer(cfg)
 	key := LayerKey(0)
 
+	// Use a target that differs from what identity-initialized KAN produces,
+	// so there's non-zero loss. With LR=0 loss never improves => plateau.
 	logits := f64tof32([]float64{1.0, 2.0, 3.0, 4.0})
-	target := f64tof32(softmax([]float64{1.0, 2.0, 3.0, 4.0}))
+	target := f64tof32(softmax([]float64{2.0, 4.0, 6.0, 8.0})) // softmax(2*logits)
 
+	seqK := 4
 	headCounts := make(map[int]bool)
 	for step := 0; step < 2000; step++ {
-		trainer.TrainStep(key, logits, target, 4, 1)
+		trainer.TrainStep(key, logits, target, seqK, 1)
 		nHeads := trainer.GetOrCreateLayer(key).NumHeads()
 		if !headCounts[nHeads] {
 			headCounts[nHeads] = true
@@ -1231,7 +1239,7 @@ func TestDynamicHeadSpawning(t *testing.T) {
 	}
 
 	// Verify the multi-head layer still produces valid output
-	out := layer.Forward(logits, 4, 1)
+	out := layer.Forward(logits, seqK, 1)
 	var sum float32
 	for _, v := range out {
 		sum += v

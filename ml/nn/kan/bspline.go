@@ -1,7 +1,5 @@
 package kan
 
-import "math"
-
 // BSplineGrid holds a uniform knot vector and evaluates cubic B-spline basis functions.
 // All computation is done in pure Go on CPU since the coefficient tensors are tiny.
 type BSplineGrid struct {
@@ -98,10 +96,17 @@ func (g *BSplineGrid) EvaluateBatch(xs []float32) [][]float32 {
 //
 // Since the forward pass applies exp(kan(x) - rowMax) / sum(exp(...)),
 // initializing to identity means the full pipeline computes:
-//   exp(x - max) / sum(exp(...)) ≈ softmax(x)
+//
+//	exp(x - max) / sum(exp(...)) ≈ softmax(x)
 //
 // This gives the KAN a near-perfect starting point, and training refines
 // it from there.
+//
+// The coefficients are the Greville abscissae of the knot vector, which is
+// the standard way to make a B-spline curve interpolate the identity. No
+// further normalization is applied — shifting or rescaling the coefficients
+// would change the effective slope away from 1.0 and break the identity
+// approximation.
 func InitSoftmaxApprox(grid *BSplineGrid) []float32 {
 	n := grid.NumBasis
 	coeffs := make([]float32, n)
@@ -123,38 +128,6 @@ func InitSoftmaxApprox(grid *BSplineGrid) []float32 {
 		}
 		if count > 0 {
 			coeffs[i] = sum / float32(count)
-		}
-	}
-
-	// Shift so geometric mean of |coefficients| = 1
-	// Since Greville abscissae span negative to positive, we shift to all-positive first
-	minC := coeffs[0]
-	for _, c := range coeffs {
-		if c < minC {
-			minC = c
-		}
-	}
-	shift := float32(0)
-	if minC <= 0 {
-		shift = -minC + 0.1
-	}
-	for i := range coeffs {
-		coeffs[i] += shift
-	}
-
-	// Now normalize geometric mean to 1
-	logSum := float64(0)
-	for _, c := range coeffs {
-		v := math.Abs(float64(c))
-		if v < 1e-10 {
-			v = 1e-10
-		}
-		logSum += math.Log(v)
-	}
-	geoMean := float32(math.Exp(logSum / float64(n)))
-	if geoMean > 1e-10 {
-		for i := range coeffs {
-			coeffs[i] /= geoMean
 		}
 	}
 

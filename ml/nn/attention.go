@@ -60,24 +60,19 @@ func GetKANTrainer() *kan.ShadowTrainer {
 	return kanTrainer
 }
 
-// GetKANPendingTensors returns all KAN training tensors that need to be
-// included in Compute() for data materialization. Call this after the
-// forward pass but before Compute(), and pass the returned tensors
-// alongside the model output.
-func GetKANPendingTensors() []ml.Tensor {
-	kanPendingMu.Lock()
-	defer kanPendingMu.Unlock()
+// ResetKANLayerCounter resets the layer counter and discards any pending
+// training items WITHOUT processing them. Use this after graph reservation,
+// where the forward pass creates pending items with tensors that were
+// reserved but never computed — processing them would train on garbage data
+// and corrupt Adam optimizer state.
+func ResetKANLayerCounter() {
+	kanLayerMu.Lock()
+	kanLayerCounter = 0
+	kanLayerMu.Unlock()
 
-	var tensors []ml.Tensor
-	for _, item := range kanPending {
-		if item.kq != nil {
-			tensors = append(tensors, item.kq)
-		}
-		if item.softmax != nil {
-			tensors = append(tensors, item.softmax)
-		}
-	}
-	return tensors
+	kanPendingMu.Lock()
+	kanPending = nil
+	kanPendingMu.Unlock()
 }
 
 // FlushKANTraining processes all deferred training work.

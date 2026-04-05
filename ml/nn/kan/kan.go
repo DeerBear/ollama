@@ -200,7 +200,6 @@ func (l *Layer) UpdateCoefficients(newWeights []float32) {
 			end = len(newWeights)
 		}
 		copy(head.Weights, newWeights[start:end])
-		head.NormalizeAndRedistribute()
 	}
 }
 

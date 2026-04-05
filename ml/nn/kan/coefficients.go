@@ -13,12 +13,12 @@ type Coefficients struct {
 }
 
 // NewCoefficients creates a new coefficient set initialized to approximate softmax.
+// The initial weights are Greville abscissae (identity approximation) and are NOT
+// normalized — normalization would change the effective slope away from 1.0.
 func NewCoefficients(grid *BSplineGrid) *Coefficients {
-	c := &Coefficients{
+	return &Coefficients{
 		Weights: InitSoftmaxApprox(grid),
 	}
-	c.NormalizeAndRedistribute()
-	return c
 }
 
 // NewCoefficientsFromWeights creates a coefficient set from existing weights.

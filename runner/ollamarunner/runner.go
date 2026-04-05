@@ -1285,10 +1285,12 @@ func (s *Server) allocModel(
 		return err
 	}
 
-	// Reset KAN layer counter after graph reservation. The reservation
-	// forward passes increment the counter but don't call FlushKANTraining,
-	// leaving it at a non-zero offset. Reset so inference layers start at 0.
-	nn.FlushKANTraining()
+	// Reset KAN layer counter after graph reservation and discard pending
+	// training items. The reservation forward passes create pending items
+	// with tensors that were reserved but never computed — processing them
+	// via FlushKANTraining would train on uninitialized memory and corrupt
+	// Adam optimizer state.
+	nn.ResetKANLayerCounter()
 
 	return nil
 }
