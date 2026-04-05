@@ -18,6 +18,7 @@ import time
 import torch
 import torch.nn.functional as F
 import numpy as np
+import tiktoken
 
 # nanoGPT is at /app/nanoGPT
 sys.path.insert(0, "/app/nanoGPT")
@@ -34,7 +35,7 @@ logger = logging.getLogger("kan-demo")
 # ═══════════════════════════════════════════════════════════════════════
 # Config
 # ═══════════════════════════════════════════════════════════════════════
-CHECKPOINT_DIR = "out-shakespeare-char"
+CHECKPOINT_DIR = "out-gutenberg"
 DEVICE = "cpu"
 SEED = 42
 NUM_TOKENS = 200  # tokens to generate per prompt
@@ -92,15 +93,10 @@ def load_model():
 
 
 def load_tokenizer():
-    """Load the character-level tokenizer from Shakespeare data."""
-    import pickle
-    meta_path = os.path.join("data/shakespeare_char", "meta.pkl")
-    with open(meta_path, "rb") as f:
-        meta = pickle.load(f)
-    stoi = meta["stoi"]
-    itos = meta["itos"]
-    encode = lambda s: [stoi[c] for c in s if c in stoi]
-    decode = lambda l: "".join([itos[i] for i in l])
+    """Load the GPT-2 tokenizer (matches the Gutenberg training data)."""
+    enc = tiktoken.get_encoding("gpt2")
+    encode = lambda s: enc.encode(s, allowed_special=set())
+    decode = lambda l: enc.decode(l)
     return encode, decode
 
 

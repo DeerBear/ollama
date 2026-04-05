@@ -5,6 +5,9 @@
 # nanoGPT's source code is NOT modified — the integration is done via
 # runtime monkey-patching of the attention forward method.
 #
+# Dataset: Gutenberg, Dammit by Allison Parrish
+# https://github.com/aparrish/gutenberg-dammit
+#
 # The Dockerfile IS the proof: every step is visible and auditable.
 #
 # Build:
@@ -31,27 +34,36 @@ RUN pip install --no-cache-dir \
     pip install --no-cache-dir \
     numpy tiktoken datasets transformers
 
-# ── Step 3: Prepare training data ────────────────────────────────────
-# Shakespeare char-level: small, fast to train, well-known baseline
-RUN cd /app/nanoGPT && python data/shakespeare_char/prepare.py
+# ── Step 3: Prepare training data from Gutenberg, Dammit ────────────
+# Downloads the corpus ZIP (~1.2 GB) from Allison Parrish's archive,
+# extracts English texts, tokenizes with GPT-2 encoding, saves as
+# train.bin / val.bin in nanoGPT's expected format.
+#
+# Source: https://github.com/aparrish/gutenberg-dammit
+# Data:   http://static.decontextualize.com/gutenberg-dammit-files-v002.zip
+COPY prepare_gutenberg.py /app/nanoGPT/data/gutenberg_dammit/prepare.py
+RUN cd /app/nanoGPT && python data/gutenberg_dammit/prepare.py
 
-# ── Step 4: Train a baseline model ───────────────────────────────────
-# 6 layers, 6 heads, 384 dim, 2000 iters on CPU
+# ── Step 4: Train a baseline model ──────────────────────────────────
+# 6 layers, 6 heads, 384 dim — trained on real multilingual literature
+# from Project Gutenberg. Uses GPT-2 tokenizer (not char-level).
 RUN cd /app/nanoGPT && python train.py \
     config/train_shakespeare_char.py \
     --device=cpu \
     --compile=False \
     --max_iters=2000 \
-    --eval_interval=500
+    --eval_interval=500 \
+    --dataset=gutenberg_dammit \
+    --out_dir=out-gutenberg
 
 # ── Step 5: Verify nanoGPT source is unmodified ─────────────────────
 # This proves we didn't touch Karpathy's code during training
 RUN cd /app/nanoGPT && git diff --stat && git status
 
 # ── Step 6: Copy in the ONLY custom code ─────────────────────────────
-# kan/          — the Geometric KAN implementation (B-splines, shadow trainer)
+# kan/             — Geometric KAN implementation (B-splines, shadow trainer)
 # kan_integrate.py — runtime monkey-patch to hook KAN into attention
-# demo.py       — the A/B comparison script
+# demo.py          — A/B comparison script
 COPY kan/ /app/nanoGPT/kan/
 COPY kan_integrate.py /app/nanoGPT/kan_integrate.py
 COPY demo.py /app/nanoGPT/demo.py
