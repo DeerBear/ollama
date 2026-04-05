@@ -62,6 +62,20 @@ WARMUP_PROMPTS = [
     "There lived in a small village a young",
 ]
 
+# Fixed held-out passages for idempotent perplexity measurement.
+# These never change between baseline and KAN — the ONLY variable
+# is the attention mechanism. Same model, same text, same tokens.
+EVAL_PASSAGES = [
+    "It is a truth universally acknowledged, that a single man in possession of a good fortune, must be in want of a wife. However little known the feelings or views of such a man may be on his first entering a neighbourhood, this truth is so well fixed in the minds of the surrounding families, that he is considered as the rightful property of some one or other of their daughters.",
+    "Call me Ishmael. Some years ago, never mind how long precisely, having little or no money in my purse, and nothing particular to interest me on shore, I thought I would sail about a little and see the watery part of the world. It is a way I have of driving off the spleen and regulating the circulation.",
+    "In the beginning God created the heaven and the earth. And the earth was without form, and void; and darkness was upon the face of the deep. And the Spirit of God moved upon the face of the waters. And God said, Let there be light: and there was light.",
+    "It was the best of times, it was the worst of times, it was the age of wisdom, it was the age of foolishness, it was the epoch of belief, it was the epoch of incredulity, it was the season of Light, it was the season of Darkness, it was the spring of hope, it was the winter of despair.",
+    "Happy families are all alike; every unhappy family is unhappy in its own way. Everything was in confusion in the Oblonskys' house. The wife had discovered that the husband was carrying on an intrigue with a French girl, who had been a governess in their family.",
+    "Whether I shall turn out to be the hero of my own life, or whether that station will be held by anybody else, these pages must show. To begin my life with the beginning of my life, I record that I was born on a Friday, at twelve o'clock at night.",
+    "I am an invisible man. No, I am not a spook like those who haunted Edgar Allan Poe; nor am I one of your Hollywood movie ectoplasms. I am a man of substance, of flesh and bone, fiber and liquids, and I might even be said to possess a mind.",
+    "The cold passed reluctantly from the earth, and the retiring fogs revealed an army stretched out on the hills, resting. As the landscape changed from brown to green, the army awakened, and began to tremble with eagerness at the noise of rumors.",
+]
+
 # ═══════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════
@@ -180,10 +194,15 @@ def info(text):
 
 def main():
     header("Geometric KAN Attention A/B Demo")
-    info("Model: nanoGPT (Shakespeare char-level, 6L/6H/384D)")
+    info("Model: nanoGPT (Gutenberg, 6L/6H/384D)")
     info("Source: github.com/karpathy/nanoGPT (unmodified)")
+    info("Dataset: Gutenberg, Dammit by Allison Parrish")
     info("Custom code: kan/ directory only")
     print()
+
+    # Lock down all randomness
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
 
     # Load model and tokenizer
     info("Loading pretrained model...")
@@ -192,28 +211,39 @@ def main():
     info(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
     print()
 
-    # ─── Step 1: Baseline (standard softmax) ─────────────────────────
-    header("Step 1: Baseline (Standard Softmax)")
+    # ─── Step 1: Baseline perplexity on FIXED passages ───────────────
+    header("Step 1: Baseline Perplexity (Standard Softmax)")
+    info("Measuring perplexity on 8 fixed literary passages.")
+    info("These passages are IDENTICAL for baseline and KAN.")
+    info("The ONLY variable is the attention mechanism.")
+    print()
+
+    baseline_ppls = []
+    for i, passage in enumerate(EVAL_PASSAGES):
+        ppl = compute_perplexity(model, encode, passage)
+        baseline_ppls.append(ppl)
+        print(f"  {BOLD}Passage {i+1}:{NC} {passage[:60]}...")
+        print(f"  {RED}Baseline PPL: {ppl:.4f}{NC}")
+        print()
+
+    baseline_mean = np.mean(baseline_ppls)
+    info(f"Baseline mean perplexity: {baseline_mean:.4f}")
+    print()
+
+    # ─── Step 2: Baseline generation (for visual comparison) ─────────
+    header("Step 2: Baseline Generation")
 
     baseline_results = []
     for i, prompt in enumerate(TEST_PROMPTS):
-        print(f"{BOLD}{CYAN}Test {i+1}: {prompt}...{NC}")
-        result = generate(model, encode, decode, prompt)
+        torch.manual_seed(SEED + i)  # Per-prompt seed for reproducibility
+        print(f"{BOLD}{CYAN}Prompt {i+1}: {prompt}...{NC}")
+        result = generate(model, encode, decode, prompt, seed=SEED + i)
         print(f"  {result[:200]}")
         baseline_results.append(result)
         print()
 
-    # Baseline perplexity on generated text
-    info("Computing baseline perplexity...")
-    baseline_ppls = []
-    for prompt, result in zip(TEST_PROMPTS, baseline_results):
-        ppl = compute_perplexity(model, encode, prompt + result)
-        baseline_ppls.append(ppl)
-    info(f"Baseline mean perplexity: {np.mean(baseline_ppls):.2f}")
-    print()
-
-    # ─── Step 2: Install KAN attention ───────────────────────────────
-    header("Step 2: Installing KAN Attention")
+    # ─── Step 3: Install KAN attention ───────────────────────────────
+    header("Step 3: Installing KAN Attention")
 
     from kan.shadow import ShadowTrainer
     from kan_integrate import patch_attention_with_kan
@@ -224,14 +254,15 @@ def main():
     info(f"KAN installed on {len(list(model.transformer.h))} attention layers")
     print()
 
-    # ─── Step 3: Warm up the KAN ─────────────────────────────────────
-    header("Step 3: KAN Training (Warm-Up)")
-    info(f"Running {KAN_WARMUP_PROMPTS} warm-up prompts to train KAN...")
+    # ─── Step 4: Warm up the KAN ─────────────────────────────────────
+    header("Step 4: KAN Training (Warm-Up)")
+    info(f"Running {KAN_WARMUP_PROMPTS} warm-up prompts to shadow-train KAN...")
+    info("KAN learns to match softmax during these forward passes.")
     print()
 
     for i, prompt in enumerate(WARMUP_PROMPTS[:KAN_WARMUP_PROMPTS]):
         info(f"Warm-up {i+1}/{KAN_WARMUP_PROMPTS}: {prompt[:50]}...")
-        _ = generate(model, encode, decode, prompt, num_tokens=300)
+        _ = generate(model, encode, decode, prompt, num_tokens=300, seed=SEED + 100 + i)
 
         stats = trainer.stats()
         converged = stats["converged"]
@@ -242,67 +273,87 @@ def main():
     info(f"Warm-up complete. Final stats: {trainer.stats()}")
     print()
 
-    # ─── Step 4: KAN inference ───────────────────────────────────────
-    header("Step 4: KAN Attention Inference")
+    # ─── Step 5: KAN perplexity on THE SAME fixed passages ──────────
+    header("Step 5: KAN Perplexity (Same Passages, Same Model)")
+    info("Measuring perplexity on the EXACT SAME 8 passages.")
+    info("Same model weights. Same tokens. Only attention changed.")
+    print()
+
+    kan_ppls = []
+    for i, passage in enumerate(EVAL_PASSAGES):
+        ppl = compute_perplexity(model, encode, passage)
+        kan_ppls.append(ppl)
+        print(f"  {BOLD}Passage {i+1}:{NC} {passage[:60]}...")
+        print(f"  {GREEN}KAN PPL:      {ppl:.4f}{NC}")
+        print(f"  {RED}Baseline PPL: {baseline_ppls[i]:.4f}{NC}")
+        delta = baseline_ppls[i] - ppl
+        pct = (delta / baseline_ppls[i]) * 100 if baseline_ppls[i] > 0 else 0
+        marker = GREEN + "BETTER" if delta > 0 else (RED + "WORSE" if delta < 0 else YELLOW + "SAME")
+        print(f"  {marker} ({pct:+.4f}%){NC}")
+        print()
+
+    kan_mean = np.mean(kan_ppls)
+    info(f"KAN mean perplexity: {kan_mean:.4f}")
+    print()
+
+    # ─── Step 6: KAN generation (visual comparison) ──────────────────
+    header("Step 6: KAN Generation")
 
     kan_results = []
     for i, prompt in enumerate(TEST_PROMPTS):
-        print(f"{BOLD}{CYAN}Test {i+1}: {prompt}...{NC}")
-        result = generate(model, encode, decode, prompt)
+        torch.manual_seed(SEED + i)
+        print(f"{BOLD}{CYAN}Prompt {i+1}: {prompt}...{NC}")
+        result = generate(model, encode, decode, prompt, seed=SEED + i)
         print(f"  {result[:200]}")
         kan_results.append(result)
         print()
 
-    # KAN perplexity
-    info("Computing KAN perplexity...")
-    kan_ppls = []
-    for prompt, result in zip(TEST_PROMPTS, kan_results):
-        ppl = compute_perplexity(model, encode, prompt + result)
-        kan_ppls.append(ppl)
-    info(f"KAN mean perplexity: {np.mean(kan_ppls):.2f}")
-    print()
-
-    # ─── Step 5: Side-by-side comparison ─────────────────────────────
-    header("A/B Comparison")
-
-    for i, prompt in enumerate(TEST_PROMPTS):
-        print(f"{BOLD}{CYAN}Test {i+1}: {prompt}...{NC}")
-        print(f"  {RED}Baseline:{NC} {baseline_results[i][:150]}")
-        print(f"  {GREEN}KAN:     {NC} {kan_results[i][:150]}")
-        print(f"  {YELLOW}PPL:     {NC} baseline={baseline_ppls[i]:.2f}  kan={kan_ppls[i]:.2f}")
-        print()
-
     # ─── Final scoreboard ────────────────────────────────────────────
-    header("Final Scoreboard")
-
-    baseline_mean = np.mean(baseline_ppls)
-    kan_mean = np.mean(kan_ppls)
-
-    print(f"  {RED}Baseline mean perplexity: {baseline_mean:.2f}{NC}")
-    print(f"  {GREEN}KAN mean perplexity:      {kan_mean:.2f}{NC}")
+    header("RESULTS: Idempotent Perplexity Comparison")
+    info("Same model. Same passages. Same tokens. Only attention differs.")
     print()
+
+    for i, passage in enumerate(EVAL_PASSAGES):
+        delta = baseline_ppls[i] - kan_ppls[i]
+        pct = (delta / baseline_ppls[i]) * 100 if baseline_ppls[i] > 0 else 0
+        marker = GREEN if delta > 0 else (RED if delta < 0 else YELLOW)
+        print(f"  Passage {i+1}: baseline={baseline_ppls[i]:.4f}  "
+              f"kan={kan_ppls[i]:.4f}  {marker}delta={pct:+.4f}%{NC}")
+    print()
+
+    print(f"  {RED}Baseline mean: {baseline_mean:.4f}{NC}")
+    print(f"  {GREEN}KAN mean:      {kan_mean:.4f}{NC}")
+    print()
+
+    overall_delta = baseline_mean - kan_mean
+    overall_pct = (overall_delta / baseline_mean) * 100 if baseline_mean > 0 else 0
 
     kan_wins = sum(1 for b, k in zip(baseline_ppls, kan_ppls) if k < b)
     baseline_wins = sum(1 for b, k in zip(baseline_ppls, kan_ppls) if b < k)
     ties = len(baseline_ppls) - kan_wins - baseline_wins
 
-    print(f"  {GREEN}KAN wins:      {kan_wins}/{len(TEST_PROMPTS)} (lower perplexity){NC}")
-    print(f"  {RED}Baseline wins: {baseline_wins}/{len(TEST_PROMPTS)}{NC}")
-    print(f"  {YELLOW}Ties:          {ties}/{len(TEST_PROMPTS)}{NC}")
+    print(f"  {GREEN}KAN wins:      {kan_wins}/{len(EVAL_PASSAGES)}{NC}")
+    print(f"  {RED}Baseline wins: {baseline_wins}/{len(EVAL_PASSAGES)}{NC}")
+    print(f"  {YELLOW}Ties:          {ties}/{len(EVAL_PASSAGES)}{NC}")
     print()
 
-    if kan_mean < baseline_mean:
-        improvement = (1 - kan_mean / baseline_mean) * 100
-        print(f"  {BOLD}{GREEN}KAN improves perplexity by {improvement:.1f}%{NC}")
-    elif baseline_mean < kan_mean:
-        regression = (kan_mean / baseline_mean - 1) * 100
-        print(f"  {BOLD}{RED}KAN regresses perplexity by {regression:.1f}%{NC}")
+    if overall_pct > 0:
+        print(f"  {BOLD}{GREEN}KAN improves perplexity by {overall_pct:.4f}%{NC}")
+    elif overall_pct < 0:
+        print(f"  {BOLD}{RED}KAN regresses perplexity by {-overall_pct:.4f}%{NC}")
     else:
         print(f"  {BOLD}{YELLOW}Dead tie{NC}")
-
     print()
 
-    # Final convergence stats
+    # ─── Generation side-by-side (qualitative) ───────────────────────
+    header("Generation Comparison (Qualitative)")
+    for i, prompt in enumerate(TEST_PROMPTS):
+        print(f"{BOLD}{CYAN}Prompt: {prompt}...{NC}")
+        print(f"  {RED}Baseline:{NC} {baseline_results[i][:150]}")
+        print(f"  {GREEN}KAN:     {NC} {kan_results[i][:150]}")
+        print()
+
+    # ─── KAN training stats ──────────────────────────────────────────
     header("KAN Training Stats")
     stats = trainer.stats()
     for k, v in stats.items():
@@ -313,7 +364,8 @@ def main():
              f"ema_loss={state.ema_loss:.6f} heads={state.kan.num_heads}")
 
     print()
-    info("Done. All code is auditable in the Dockerfile and kan/ directory.")
+    info("This test is IDEMPOTENT: run it again, get the same numbers.")
+    info("All code is auditable in the Dockerfile and kan/ directory.")
 
 
 if __name__ == "__main__":
