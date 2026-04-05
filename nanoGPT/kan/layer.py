@@ -19,8 +19,11 @@ class KANLayer(nn.Module):
 
     Forward: logits -> B-spline transform -> exp-normalize -> attention weights
 
-    The B-spline transform is initialized to identity (Greville abscissae),
-    so the full pipeline starts as exactly softmax.
+    Coefficients start as small random values. The KAN does NOT start as
+    softmax — it DISCOVERS softmax through Phase 1 shadow training. This is
+    the core thesis: a general-purpose learnable function converges to
+    softmax independently, proving softmax is a natural optimum, then
+    evolves beyond it in Phase 2.
     """
 
     def __init__(self, order: int = 3, num_basis: int = 8,
@@ -28,8 +31,9 @@ class KANLayer(nn.Module):
         super().__init__()
         self.grid = BSplineGrid(order, num_basis, grid_min, grid_max)
 
-        # Head 0: identity initialization (Greville abscissae)
-        init_coeffs = self.grid.greville_abscissae()
+        # Small random initialization — NOT identity, NOT Greville.
+        # Phase 1 shadow training will converge these to softmax.
+        init_coeffs = torch.randn(num_basis) * 0.01
         self.heads = nn.ParameterList([nn.Parameter(init_coeffs)])
 
     @property
@@ -45,8 +49,8 @@ class KANLayer(nn.Module):
     def expand_if_needed(self, logits: torch.Tensor):
         """Expand grid if logits fall outside current range.
 
-        Head 0 gets identity coefficients for new basis functions.
-        Other heads get zeros (remain no-op in expanded region).
+        New basis functions get zero coefficients — the optimizer will
+        learn appropriate values through shadow training.
         """
         lo = logits.min().item()
         hi = logits.max().item()
@@ -55,15 +59,11 @@ class KANLayer(nn.Module):
             return
 
         new_grid, left_offset = self.grid.expand(lo, hi)
-        greville = new_grid.greville_abscissae()
 
         new_heads = []
-        for h, head in enumerate(self.heads):
+        for head in self.heads:
             new_w = torch.zeros(new_grid.num_basis)
-            if h == 0:
-                # Primary head: fill with Greville (identity), overlay trained
-                new_w.copy_(greville)
-            # Copy old coefficients into shifted positions
+            # Copy existing trained coefficients into shifted positions
             new_w[left_offset : left_offset + len(head.data)] = head.data
             new_heads.append(nn.Parameter(new_w))
 

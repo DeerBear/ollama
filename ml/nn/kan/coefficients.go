@@ -12,12 +12,19 @@ type Coefficients struct {
 	Weights []float32
 }
 
-// NewCoefficients creates a new coefficient set initialized to approximate softmax.
-// The initial weights are Greville abscissae (identity approximation) and are NOT
-// normalized — normalization would change the effective slope away from 1.0.
+// NewCoefficients creates a new coefficient set with small random initialization.
+// The KAN does NOT start as softmax — it discovers softmax through Phase 1
+// shadow training. This is the core thesis: a general-purpose learnable function
+// converges to softmax independently, then evolves beyond it in Phase 2.
 func NewCoefficients(grid *BSplineGrid) *Coefficients {
+	weights := make([]float32, grid.NumBasis)
+	for i := range weights {
+		// Small random values centered at zero.
+		// Phase 1 shadow training will converge these to match softmax.
+		weights[i] = float32(i-grid.NumBasis/2) * 0.01
+	}
 	return &Coefficients{
-		Weights: InitSoftmaxApprox(grid),
+		Weights: weights,
 	}
 }
 

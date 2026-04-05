@@ -22,7 +22,8 @@ type Layer struct {
 	mu    sync.RWMutex
 }
 
-// NewLayer creates a KAN layer with one head initialized to approximate softmax.
+// NewLayer creates a KAN layer with one head initialized to small random values.
+// The KAN discovers softmax through Phase 1 shadow training, not initialization.
 func NewLayer(cfg Config) *Layer {
 	grid := NewBSplineGrid(cfg.Order, cfg.NumBasis, cfg.GridMin, cfg.GridMax)
 	return &Layer{
@@ -91,12 +92,8 @@ func (l *Layer) Snapshot() *Layer {
 
 // expandIfNeeded checks whether any value in logits falls outside the B-spline
 // grid's active region. If so, expands the grid and all heads' coefficient
-// vectors so the identity property f(x) = x holds for the entire observed range.
-//
-// Head 0 (the primary head, initialized with Greville abscissae) gets identity-
-// approximating coefficients for new basis functions. Other heads (spawned later,
-// potentially trained) get zeros for new positions so they remain no-ops in the
-// expanded region.
+// vectors. New basis functions get zero coefficients — the optimizer will
+// learn appropriate values through shadow training.
 //
 // Must be called with l.mu NOT held (acquires write lock internally if needed).
 func (l *Layer) expandIfNeeded(logits []float32) {
@@ -129,16 +126,10 @@ func (l *Layer) expandIfNeeded(logits []float32) {
 	}
 
 	newGrid, leftOffset := l.Grid.Expand(needMin, needMax)
-	greville := InitSoftmaxApprox(newGrid)
 
-	for h, head := range l.Heads {
+	for _, head := range l.Heads {
 		newWeights := make([]float32, newGrid.NumBasis)
-		if h == 0 {
-			// Primary head: fill with Greville abscissae (identity), then
-			// overlay existing trained coefficients at the correct positions.
-			copy(newWeights, greville)
-		}
-		// Copy old coefficients into their new positions (shifted by leftOffset)
+		// Copy existing trained coefficients into their new positions
 		for i, w := range head.Weights {
 			newWeights[i+leftOffset] = w
 		}
