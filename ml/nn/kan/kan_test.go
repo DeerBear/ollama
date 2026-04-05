@@ -520,6 +520,252 @@ func TestShadowTrainerMultiQueryAttention(t *testing.T) {
 	}
 }
 
+// ============================================================
+// Zero-shot identity: KAN must match softmax at initialization
+// before any training occurs.
+// ============================================================
+
+func TestKANMatchesSoftmaxAtInitialization(t *testing.T) {
+	cfg := DefaultConfig()
+
+	distributions := []struct {
+		name   string
+		logits []float64
+	}{
+		{"ascending", []float64{1.0, 2.0, 3.0, 4.0}},
+		{"descending", []float64{4.0, 3.0, 2.0, 1.0}},
+		{"uniform", []float64{0.0, 0.0, 0.0, 0.0}},
+		{"sharp_peak", []float64{0.0, 0.0, 5.0, 0.0}},
+		{"negative", []float64{-2.0, -1.0, 0.0, 1.0}},
+		{"small_range", []float64{0.1, 0.2, 0.3, 0.4}},
+		{"wide_range", []float64{-4.0, -2.0, 0.0, 2.0, 4.0}},
+		{"single_element", []float64{3.14}},
+		{"two_elements", []float64{-1.0, 1.0}},
+	}
+
+	for _, dist := range distributions {
+		t.Run(dist.name, func(t *testing.T) {
+			layer := NewLayer(cfg)
+			target := softmax(dist.logits)
+			logits := f64tof32(dist.logits)
+			kanOut := layer.Forward(logits, len(logits), 1)
+
+			for i := range kanOut {
+				diff := math.Abs(float64(kanOut[i]) - target[i])
+				if diff > 1e-4 {
+					t.Errorf("element %d: kan=%.6f softmax=%.6f diff=%.6f",
+						i, kanOut[i], target[i], diff)
+				}
+			}
+
+			t.Logf("logits=%-30v max|err|<1e-4", dist.logits)
+		})
+	}
+}
+
+// =========================================================================
+// Stability under training: the KAN starts correct and stays correct after
+// many training passes. Verifies that the optimizer doesn't push a
+// near-perfect initialization off a cliff.
+// =========================================================================
+
+func TestKANStaysStableUnderTraining(t *testing.T) {
+	distributions := []struct {
+		name   string
+		logits []float64
+	}{
+		{"ascending", []float64{1.0, 2.0, 3.0, 4.0}},
+		{"negative", []float64{-2.0, -1.0, 0.0, 1.0}},
+		{"sharp_peak", []float64{0.0, 0.0, 5.0, 0.0}},
+		{"small_range", []float64{0.1, 0.2, 0.3, 0.4}},
+	}
+
+	for _, dist := range distributions {
+		t.Run(dist.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.LearningRate = 0.01
+			cfg.TrainEveryN = 1
+			trainer := NewShadowTrainer(cfg)
+			key := LayerKey(0)
+
+			target := f64tof32(softmax(dist.logits))
+			logits := f64tof32(dist.logits)
+
+			// Record error at initialization (step 0)
+			layer := trainer.GetOrCreateLayer(key)
+			initOut := layer.Forward(logits, len(logits), 1)
+			initMSE := mse(target, initOut)
+
+			// Train for many steps
+			var finalLoss float64
+			for i := 0; i < 500; i++ {
+				finalLoss = trainer.TrainStep(key, logits, target, len(logits), 1)
+			}
+
+			// Error after training must not exceed error at init
+			finalOut := trainer.GetOrCreateLayer(key).Forward(logits, len(logits), 1)
+			finalMSE := mse(target, finalOut)
+
+			t.Logf("dist=%-12s init_mse=%.2e  final_mse=%.2e  ema_loss=%.2e",
+				dist.name, initMSE, finalMSE, finalLoss)
+
+			if finalMSE > initMSE+1e-6 {
+				t.Errorf("training degraded quality: init_mse=%.2e final_mse=%.2e", initMSE, finalMSE)
+			}
+
+			// Absolute accuracy check: each element within 0.005 of softmax
+			for i := range finalOut {
+				diff := math.Abs(float64(finalOut[i]) - float64(target[i]))
+				if diff > 0.005 {
+					t.Errorf("element %d: kan=%.6f softmax=%.6f diff=%.6f",
+						i, finalOut[i], target[i], diff)
+				}
+			}
+		})
+	}
+}
+
+// =========================================================================
+// Adversarial convergence: pathological logit distributions from broken or
+// poorly-trained models. The KAN should still converge (or at least not
+// explode) even when fed logits that are extreme, degenerate, or numerical
+// nightmares.
+// =========================================================================
+
+func TestKANConvergesOnPathologicalInputs(t *testing.T) {
+	distributions := []struct {
+		name   string
+		logits []float64
+		seqK   int
+		seqQ   int
+	}{
+		// Huge dynamic range: logits span 200 units.
+		// softmax collapses to one-hot on element 4.
+		{"extreme_range", []float64{-100.0, -50.0, 0.0, 50.0, 100.0}, 5, 1},
+
+		// Near-overflow: logits at the edge of float32 (~88 is exp overflow).
+		// softmax should still be valid via max-subtract trick.
+		{"near_overflow", []float64{85.0, 86.0, 87.0, 88.0}, 4, 1},
+
+		// Near-underflow: very negative logits. All exp() values are tiny
+		// but ratios should still be valid.
+		{"near_underflow", []float64{-85.0, -86.0, -87.0, -88.0}, 4, 1},
+
+		// All identical large values: uniform despite huge magnitude.
+		{"large_uniform", []float64{500.0, 500.0, 500.0, 500.0}, 4, 1},
+
+		// One hot-ish: one logit massively dominates.
+		{"one_hot", []float64{0.0, 0.0, 0.0, 50.0}, 4, 1},
+
+		// Adversarial near-ties: logits differ by epsilon.
+		// softmax should be near-uniform, and the KAN must preserve this.
+		{"epsilon_ties", []float64{1.0, 1.0 + 1e-7, 1.0 + 2e-7, 1.0 + 3e-7}, 4, 1},
+
+		// Long sequence: 64 keys, simulating a long-context attention row.
+		{"long_sequence", func() []float64 {
+			v := make([]float64, 64)
+			for i := range v {
+				v[i] = float64(i) * 0.1
+			}
+			return v
+		}(), 64, 1},
+
+		// Multi-row with mixed pathologies: 3 queries, each with different nastiness.
+		{"multi_row_chaos", []float64{
+			// row 0: extreme spike
+			-10.0, -10.0, -10.0, 20.0,
+			// row 1: near-uniform
+			0.001, 0.002, 0.003, 0.004,
+			// row 2: alternating extremes
+			-50.0, 50.0, -50.0, 50.0,
+		}, 4, 3},
+
+		// Alternating signs with large magnitude.
+		{"oscillating", []float64{-30.0, 30.0, -30.0, 30.0, -30.0, 30.0}, 6, 1},
+
+		// Single token: degenerate 1-element softmax (must be 1.0).
+		{"single_token", []float64{42.0}, 1, 1},
+
+		// Two tokens, massive gap.
+		{"two_token_gap", []float64{0.0, 100.0}, 2, 1},
+	}
+
+	for _, dist := range distributions {
+		t.Run(dist.name, func(t *testing.T) {
+			// Compute reference softmax per row
+			flatTarget := make([]float32, len(dist.logits))
+			for q := 0; q < dist.seqQ; q++ {
+				start := q * dist.seqK
+				end := start + dist.seqK
+				row := dist.logits[start:end]
+				sm := softmax(row)
+				for i, v := range sm {
+					flatTarget[start+i] = float32(v)
+				}
+			}
+
+			logits := f64tof32(dist.logits)
+
+			cfg := DefaultConfig()
+			cfg.LearningRate = 0.01
+			cfg.TrainEveryN = 1
+			cfg.ConvergenceThreshold = 0.01 // Generous for pathological inputs
+			cfg.ConvergenceWindow = 10
+			trainer := NewShadowTrainer(cfg)
+			key := LayerKey(0)
+
+			// Check zero-shot accuracy first
+			initOut := trainer.GetOrCreateLayer(key).Forward(logits, dist.seqK, dist.seqQ)
+			initMSE := mse(flatTarget, initOut)
+
+			// Train
+			var finalLoss float64
+			for i := 0; i < 300; i++ {
+				finalLoss = trainer.TrainStep(key, logits, flatTarget, dist.seqK, dist.seqQ)
+			}
+
+			finalOut := trainer.GetOrCreateLayer(key).Forward(logits, dist.seqK, dist.seqQ)
+			finalMSE := mse(flatTarget, finalOut)
+
+			t.Logf("dist=%-18s init_mse=%.2e  final_mse=%.2e  ema=%.2e",
+				dist.name, initMSE, finalMSE, finalLoss)
+
+			// Must not explode: final MSE should be finite and bounded.
+			// Threshold is generous (0.25) because pathological inputs may
+			// have logits far outside the B-spline grid [-5, 5], where the
+			// KAN can't distinguish values. The goal is "no NaN, no Inf,
+			// valid probabilities" — not perfect accuracy on insane inputs.
+			if math.IsNaN(finalMSE) || math.IsInf(finalMSE, 0) {
+				t.Fatalf("MSE is NaN/Inf — KAN exploded")
+			}
+			if finalMSE > 0.25 {
+				t.Errorf("MSE too high: %.4f (expected < 0.25)", finalMSE)
+			}
+
+			// Output must be valid probabilities: non-negative, rows sum to 1
+			for q := 0; q < dist.seqQ; q++ {
+				start := q * dist.seqK
+				end := start + dist.seqK
+				var rowSum float32
+				for i := start; i < end; i++ {
+					if finalOut[i] < -1e-6 {
+						t.Errorf("row %d: negative probability %.6f at index %d", q, finalOut[i], i)
+					}
+					rowSum += finalOut[i]
+				}
+				if math.Abs(float64(rowSum-1.0)) > 0.01 {
+					t.Errorf("row %d: sum=%.6f, expected 1.0", q, rowSum)
+				}
+			}
+
+			// Training must not make things worse
+			if finalMSE > initMSE+1e-4 {
+				t.Errorf("training degraded: init_mse=%.2e final_mse=%.2e", initMSE, finalMSE)
+			}
+		})
+	}
+}
+
 // ========================================
 // Serialization round-trip with real data
 // ========================================
