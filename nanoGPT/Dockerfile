@@ -42,7 +42,7 @@ RUN pip install --no-cache-dir \
 # Source: https://github.com/aparrish/gutenberg-dammit
 # Data:   http://static.decontextualize.com/gutenberg-dammit-files-v002.zip
 COPY prepare_gutenberg.py /app/nanoGPT/data/gutenberg_dammit/prepare.py
-RUN cd /app/nanoGPT && python data/gutenberg_dammit/prepare.py
+RUN cd /app/nanoGPT && GUTENBERG_MAX_TEXTS=1000 python data/gutenberg_dammit/prepare.py
 
 # ── Step 4: Train a baseline model ──────────────────────────────────
 # 6 layers, 6 heads, 384 dim — trained on real multilingual literature
