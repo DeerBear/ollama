@@ -730,16 +730,13 @@ func TestKANConvergesOnPathologicalInputs(t *testing.T) {
 			t.Logf("dist=%-18s init_mse=%.2e  final_mse=%.2e  ema=%.2e",
 				dist.name, initMSE, finalMSE, finalLoss)
 
-			// Must not explode: final MSE should be finite and bounded.
-			// Threshold is generous (0.25) because pathological inputs may
-			// have logits far outside the B-spline grid [-5, 5], where the
-			// KAN can't distinguish values. The goal is "no NaN, no Inf,
-			// valid probabilities" — not perfect accuracy on insane inputs.
+			// With dynamic grid expansion, the KAN matches softmax exactly
+			// even for extreme logits. Demand near-perfect accuracy.
 			if math.IsNaN(finalMSE) || math.IsInf(finalMSE, 0) {
 				t.Fatalf("MSE is NaN/Inf — KAN exploded")
 			}
-			if finalMSE > 0.25 {
-				t.Errorf("MSE too high: %.4f (expected < 0.25)", finalMSE)
+			if finalMSE > 1e-4 {
+				t.Errorf("MSE too high: %.2e (expected < 1e-4)", finalMSE)
 			}
 
 			// Output must be valid probabilities: non-negative, rows sum to 1

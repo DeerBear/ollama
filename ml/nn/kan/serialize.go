@@ -25,14 +25,23 @@ type layerHeader struct {
 	NumHeads   uint32 // Number of cooperative KAN heads
 }
 
+// layerGridInfo stores the actual grid bounds for a layer, which may differ
+// from the config defaults if the grid was dynamically expanded.
+type layerGridInfo struct {
+	NumBasis int     `json:"num_basis"`
+	GridMin  float32 `json:"grid_min"`
+	GridMax  float32 `json:"grid_max"`
+}
+
 // metadata stores convergence state and config alongside the weights.
 type metadata struct {
-	Version   int                `json:"version"`
-	Config    Config             `json:"config"`
-	Converged map[string]bool    `json:"converged"`
-	Steps     map[string]int     `json:"steps"`
-	EMALoss   map[string]float64 `json:"ema_loss"`
-	NumHeads  map[string]int     `json:"num_heads,omitempty"`
+	Version   int                       `json:"version"`
+	Config    Config                    `json:"config"`
+	Converged map[string]bool           `json:"converged"`
+	Steps     map[string]int            `json:"steps"`
+	EMALoss   map[string]float64        `json:"ema_loss"`
+	NumHeads  map[string]int            `json:"num_heads,omitempty"`
+	GridInfo  map[string]layerGridInfo  `json:"grid_info,omitempty"`
 }
 
 // Save writes all KAN layer parameters to the given directory.
@@ -60,6 +69,7 @@ func (s *ShadowTrainer) Save(dir string) error {
 		Steps:     make(map[string]int),
 		EMALoss:   make(map[string]float64),
 		NumHeads:  make(map[string]int),
+		GridInfo:  make(map[string]layerGridInfo),
 	}
 
 	for key, state := range s.layers {
@@ -67,6 +77,11 @@ func (s *ShadowTrainer) Save(dir string) error {
 		meta.Steps[key] = state.stepCount
 		meta.EMALoss[key] = state.emaLoss
 		meta.NumHeads[key] = state.kan.NumHeads()
+		meta.GridInfo[key] = layerGridInfo{
+			NumBasis: state.kan.Grid.NumBasis,
+			GridMin:  state.kan.Grid.GridMin,
+			GridMax:  state.kan.Grid.GridMax,
+		}
 
 		if err := saveLayer(filepath.Join(dir, key+".bin"), state.kan, s.cfg); err != nil {
 			return fmt.Errorf("kan: save layer %s: %w", key, err)
@@ -112,8 +127,18 @@ func (s *ShadowTrainer) Load(dir string) error {
 			continue
 		}
 
+		// Use saved grid info if available (grid may have been dynamically
+		// expanded beyond the original config bounds). Fall back to config
+		// defaults for files saved before grid expansion was implemented.
+		loadCfg := s.cfg
+		if gi, ok := meta.GridInfo[key]; ok && gi.NumBasis > 0 {
+			loadCfg.NumBasis = gi.NumBasis
+			loadCfg.GridMin = gi.GridMin
+			loadCfg.GridMax = gi.GridMax
+		}
+
 		state := &layerState{
-			kan:       NewLayerFromWeights(s.cfg, weights),
+			kan:       NewLayerFromWeights(loadCfg, weights),
 			adam:      newAdamState(len(weights)),
 			converged: converged,
 			stepCount: meta.Steps[key],
@@ -151,8 +176,8 @@ func saveLayer(path string, kan *Layer, cfg Config) error {
 	hdr := layerHeader{
 		Magic:      kanMagic,
 		Version:    kanFileVersion,
-		NumBasis:   uint32(cfg.NumBasis),
-		Order:      uint32(cfg.Order),
+		NumBasis:   uint32(kan.Grid.NumBasis),
+		Order:      uint32(kan.Grid.Order),
 		NumWeights: uint32(len(weights)),
 		NumHeads:   uint32(numHeads),
 	}

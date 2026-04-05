@@ -1,11 +1,20 @@
 package kan
 
+import "math"
+
 // BSplineGrid holds a uniform knot vector and evaluates cubic B-spline basis functions.
 // All computation is done in pure Go on CPU since the coefficient tensors are tiny.
+//
+// The grid can be dynamically expanded via Expand() when logits fall outside the
+// current [GridMin, GridMax] range. Expansion preserves the step size and existing
+// knot positions, so previously-evaluated basis functions are unchanged.
 type BSplineGrid struct {
 	Order    int
 	NumBasis int
 	Knots    []float32 // length = NumBasis + Order + 1
+	GridMin  float32   // lower bound of the active region
+	GridMax  float32   // upper bound of the active region
+	Step     float32   // uniform spacing between interior knots
 }
 
 // NewBSplineGrid creates a uniform B-spline grid with the given parameters.
@@ -29,7 +38,45 @@ func NewBSplineGrid(order, numBasis int, gridMin, gridMax float32) *BSplineGrid 
 		Order:    order,
 		NumBasis: numBasis,
 		Knots:    knots,
+		GridMin:  gridMin,
+		GridMax:  gridMax,
+		Step:     step,
 	}
+}
+
+// Expand returns a new BSplineGrid covering [newMin, newMax] with the same step
+// size and order. Boundaries are snapped outward to step multiples so the knot
+// vector stays uniform.
+//
+// Returns the new grid and a leftOffset: old basis function i maps to new basis
+// function (i + leftOffset). This offset is needed to reposition existing
+// coefficients in the expanded weight vector.
+//
+// If the current grid already covers [newMin, newMax], returns (self, 0).
+func (g *BSplineGrid) Expand(newMin, newMax float32) (*BSplineGrid, int) {
+	// How many steps to extend in each direction?
+	leftSteps := 0
+	if newMin < g.GridMin {
+		leftSteps = int(math.Ceil(float64(g.GridMin-newMin) / float64(g.Step)))
+	}
+	rightSteps := 0
+	if newMax > g.GridMax {
+		rightSteps = int(math.Ceil(float64(newMax-g.GridMax) / float64(g.Step)))
+	}
+
+	if leftSteps == 0 && rightSteps == 0 {
+		return g, 0
+	}
+
+	expandedMin := g.GridMin - float32(leftSteps)*g.Step
+	expandedMax := g.GridMax + float32(rightSteps)*g.Step
+	newNumBasis := g.NumBasis + leftSteps + rightSteps
+
+	newGrid := NewBSplineGrid(g.Order, newNumBasis, expandedMin, expandedMax)
+	// Force the same step to avoid floating-point drift
+	newGrid.Step = g.Step
+
+	return newGrid, leftSteps
 }
 
 // Evaluate computes the values of all basis functions at a single point x.

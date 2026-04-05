@@ -75,6 +75,79 @@ func (l *Layer) AddHead(numBasis int) int {
 	return len(l.Heads)
 }
 
+// Snapshot returns a read-only copy of this layer with the same grid and
+// cloned coefficients. Used to create scratch layers for gradient estimation
+// that share the same (possibly expanded) grid as the live layer.
+func (l *Layer) Snapshot() *Layer {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	heads := make([]*Coefficients, len(l.Heads))
+	for h, head := range l.Heads {
+		heads[h] = head.Clone()
+	}
+	return &Layer{Grid: l.Grid, Heads: heads}
+}
+
+// expandIfNeeded checks whether any value in logits falls outside the B-spline
+// grid's active region. If so, expands the grid and all heads' coefficient
+// vectors so the identity property f(x) = x holds for the entire observed range.
+//
+// Head 0 (the primary head, initialized with Greville abscissae) gets identity-
+// approximating coefficients for new basis functions. Other heads (spawned later,
+// potentially trained) get zeros for new positions so they remain no-ops in the
+// expanded region.
+//
+// Must be called with l.mu NOT held (acquires write lock internally if needed).
+func (l *Layer) expandIfNeeded(logits []float32) {
+	l.mu.RLock()
+	gridMin := l.Grid.GridMin
+	gridMax := l.Grid.GridMax
+	l.mu.RUnlock()
+
+	// Fast path: scan for out-of-range logits
+	needMin := gridMin
+	needMax := gridMax
+	for _, x := range logits {
+		if x < needMin {
+			needMin = x
+		}
+		if x > needMax {
+			needMax = x
+		}
+	}
+	if needMin >= gridMin && needMax <= gridMax {
+		return // Everything fits
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// Re-check under write lock (another goroutine may have expanded already)
+	if needMin >= l.Grid.GridMin && needMax <= l.Grid.GridMax {
+		return
+	}
+
+	newGrid, leftOffset := l.Grid.Expand(needMin, needMax)
+	greville := InitSoftmaxApprox(newGrid)
+
+	for h, head := range l.Heads {
+		newWeights := make([]float32, newGrid.NumBasis)
+		if h == 0 {
+			// Primary head: fill with Greville abscissae (identity), then
+			// overlay existing trained coefficients at the correct positions.
+			copy(newWeights, greville)
+		}
+		// Copy old coefficients into their new positions (shifted by leftOffset)
+		for i, w := range head.Weights {
+			newWeights[i+leftOffset] = w
+		}
+		head.Weights = newWeights
+	}
+
+	l.Grid = newGrid
+}
+
 // Forward applies the multi-head Geometric KAN to attention logits (CPU-side).
 //
 // Input: logits as a flat float32 slice.
@@ -92,6 +165,11 @@ func (l *Layer) AddHead(numBasis int) int {
 // KAN values, each row is normalized via stable exp + L1 normalization
 // (same as softmax).
 func (l *Layer) Forward(logits []float32, seqK, seqQ int) []float32 {
+	// Expand grid if any logit falls outside the current B-spline range.
+	// This ensures f(x) = x (identity) for all x, not just within the
+	// original grid bounds. Critical for distilled models with extreme logits.
+	l.expandIfNeeded(logits)
+
 	l.mu.RLock()
 	// Snapshot all heads' coefficients
 	allCoeffs := make([][]float32, len(l.Heads))
@@ -162,6 +240,8 @@ func (l *Layer) ForwardSingleRow(logits []float32) []float32 {
 // EvaluateRaw computes the raw multi-head B-spline transform for a single point.
 // Returns Σ_head Σ_i (c_hi * B_i(x)) without any exp or normalization.
 func (l *Layer) EvaluateRaw(x float32) float32 {
+	l.expandIfNeeded([]float32{x})
+
 	l.mu.RLock()
 	allCoeffs := make([][]float32, len(l.Heads))
 	for h, head := range l.Heads {

@@ -22,6 +22,20 @@ func newAdamState(n int) *adamState {
 	}
 }
 
+// growTo expands the Adam state vectors to hold at least n parameters.
+// New parameters start with zero moments (no gradient history).
+func (a *adamState) growTo(n int) {
+	if n <= len(a.m) {
+		return
+	}
+	newM := make([]float64, n)
+	newV := make([]float64, n)
+	copy(newM, a.m)
+	copy(newV, a.v)
+	a.m = newM
+	a.v = newV
+}
+
 // ShadowTrainer manages online training of KAN layers to match softmax output.
 // It runs KAN forward passes in parallel with softmax and uses finite-difference
 // gradient estimation with Adam optimizer to update the KAN coefficients.
@@ -175,10 +189,19 @@ func (s *ShadowTrainer) TrainStep(key string, logits, softmaxOut []float32, seqK
 		return state.emaLoss
 	}
 
-	// Compute current KAN output and loss using a scratch layer
-	// to avoid mutating the live KAN during gradient estimation
-	coeffs := state.kan.GetCoefficients()
-	scratch := NewLayerFromWeights(s.cfg, coeffs)
+	// Trigger dynamic grid expansion on the live layer BEFORE snapshotting,
+	// so the snapshot gets the expanded grid and correctly-sized coefficients.
+	state.kan.expandIfNeeded(logits)
+
+	// Grow Adam state if the grid expanded (new basis functions = new parameters)
+	numCoeffs := len(state.kan.GetCoefficients())
+	if len(state.adam.m) < numCoeffs {
+		state.adam.growTo(numCoeffs)
+	}
+
+	// Snapshot for thread-safe gradient estimation on the expanded grid
+	scratch := state.kan.Snapshot()
+	coeffs := scratch.GetCoefficients()
 	kanOut := scratch.Forward(logits, seqK, seqQ)
 	baseLoss := mse(softmaxOut, kanOut)
 
@@ -270,11 +293,13 @@ func (s *ShadowTrainer) TrainStep(key string, logits, softmaxOut []float32, seqK
 	if state.plateauCount >= s.cfg.PlateauWindow &&
 		state.kan.NumHeads() < s.cfg.MaxHeads &&
 		state.stepCount-state.lastHeadSpawn > s.cfg.PlateauWindow {
-		// Spawn a new cooperative head
-		numHeads := state.kan.AddHead(s.cfg.NumBasis)
+		// Spawn a new cooperative head (use current grid's NumBasis,
+		// which may have grown via dynamic expansion)
+		currentNumBasis := state.kan.Grid.NumBasis
+		numHeads := state.kan.AddHead(currentNumBasis)
 
 		// Extend Adam state for the new head's parameters
-		newSize := numHeads * s.cfg.NumBasis
+		newSize := numHeads * currentNumBasis
 		newAdam := newAdamState(newSize)
 		copy(newAdam.m, state.adam.m)
 		copy(newAdam.v, state.adam.v)
@@ -461,9 +486,16 @@ func (s *ShadowTrainer) Phase2Step(key string, logits []float32, seqK, seqQ int)
 		return state.emaSharpness, false
 	}
 
-	// Current KAN output (using a snapshot for thread safety)
-	coeffs := state.kan.GetCoefficients()
-	scratch := NewLayerFromWeights(s.cfg, coeffs)
+	// Trigger dynamic grid expansion before Phase 2 work
+	state.kan.expandIfNeeded(logits)
+	numCoeffs := len(state.kan.GetCoefficients())
+	if state.phase2Adam != nil && len(state.phase2Adam.m) < numCoeffs {
+		state.phase2Adam.growTo(numCoeffs)
+	}
+
+	// Current KAN output (using a snapshot for thread safety and grid consistency)
+	scratch := state.kan.Snapshot()
+	coeffs := scratch.GetCoefficients()
 	kanOut := scratch.Forward(logits, seqK, seqQ)
 	baseSharpness := sharpness(kanOut, seqK, seqQ)
 
